@@ -52,16 +52,139 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "serde")]
 use serde::{self, Deserialize, Serialize};
 
-#[inline]
-fn fold(v: u64) -> u32 {
-    ((v & 0xFFFFFFFF) as u32) ^ ((v >> 32) as u32)
+fn default_hash_with_seed<T: Hash>(value: &T, seed: u64) -> u64 {
+    let mut state = wyhash::WyHash::with_seed(seed);
+    value.hash(&mut state);
+    state.finish()
+}
+
+// This custom trait allows us to fast-path &[u8] to avoid constructing the temporary Hasher object.
+// Can be simplified once specialization is stabilized.
+pub trait SeedableHash {
+    fn hash_with_seed(&self, seed: u64) -> u64;
+}
+
+impl SeedableHash for [u8] {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(self, seed)
+    }
+}
+
+impl<const N: usize> SeedableHash for [u8; N] {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(self, seed)
+    }
+}
+
+impl SeedableHash for u8 {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&[*self], seed)
+    }
+}
+
+impl SeedableHash for i16 {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&self.to_le_bytes(), seed)
+    }
+}
+
+impl SeedableHash for u16 {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&self.to_le_bytes(), seed)
+    }
+}
+
+impl SeedableHash for i32 {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&self.to_le_bytes(), seed)
+    }
+}
+
+impl SeedableHash for u32 {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&self.to_le_bytes(), seed)
+    }
+}
+
+impl SeedableHash for i64 {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&self.to_le_bytes(), seed)
+    }
+}
+
+impl SeedableHash for u64 {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&self.to_le_bytes(), seed)
+    }
+}
+
+impl SeedableHash for isize {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&self.to_le_bytes(), seed)
+    }
+}
+
+impl SeedableHash for usize {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        wyhash::wyhash(&self.to_le_bytes(), seed)
+    }
+}
+
+impl<T: SeedableHash> SeedableHash for &T {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        (**self).hash_with_seed(seed)
+    }
+}
+
+impl<T: Hash> SeedableHash for &[T] {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        default_hash_with_seed(self, seed)
+    }
+}
+
+impl<T: Hash> SeedableHash for Vec<T> {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        default_hash_with_seed(self, seed)
+    }
+}
+
+impl SeedableHash for &str {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        default_hash_with_seed(self, seed)
+    }
+}
+
+impl SeedableHash for String {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        default_hash_with_seed(self, seed)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExternallyHashed(pub u64);
+
+impl ExternallyHashed {
+    fn fast_hash64(mut seed: u64) -> u64 {
+        wyhash::wyrng(&mut seed)
+    }
+
+    fn hash_combine(h1: u64, h2: u64) -> u64 {
+        h1 ^ (h2
+            .wrapping_add(0x517cc1b727220a95)
+            .wrapping_add(h1 << 6)
+            .wrapping_add(h1 >> 2))
+    }
+}
+
+impl SeedableHash for ExternallyHashed {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        Self::hash_combine(self.0, Self::fast_hash64(seed))
+    }
 }
 
 #[inline]
-fn hash_with_seed<T: Hash + ?Sized>(iter: u64, v: &T) -> u64 {
-    let mut state = wyhash::WyHash::with_seed(1 << (iter + iter));
-    v.hash(&mut state);
-    state.finish()
+fn fold(v: u64) -> u32 {
+    ((v & 0xFFFFFFFF) as u32) ^ ((v >> 32) as u32)
 }
 
 #[inline]
@@ -70,10 +193,10 @@ fn fastmod(hash: u32, n: u32) -> u64 {
 }
 
 #[inline]
-fn hashmod<T: Hash + ?Sized>(iter: u64, v: &T, n: u64) -> u64 {
+fn hashmod<T: SeedableHash + ?Sized>(iter: u64, v: &T, n: u64) -> u64 {
     // when n < 2^32, use the fast alternative to modulo described here:
     // https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
-    let h = hash_with_seed(iter, v);
+    let h = v.hash_with_seed(1 << (iter + iter));
     if n < (1 << 32) {
         fastmod(fold(h), n as u32) as u64
     } else {
@@ -91,7 +214,52 @@ pub struct Mphf<T> {
 
 const MAX_ITERS: u64 = 100;
 
-impl<'a, T: 'a + Hash + Debug> Mphf<T> {
+impl<T> Mphf<T> {
+    fn compute_ranks(bvs: Vec<BitVector>) -> Box<[(BitVector, Box<[u64]>)]> {
+        let mut ranks = Vec::new();
+        let mut pop = 0_u64;
+
+        for bv in bvs {
+            let mut rank: Vec<u64> = Vec::new();
+            for i in 0..bv.num_words() {
+                let v = bv.get_word(i);
+
+                if i % 8 == 0 {
+                    rank.push(pop)
+                }
+
+                pop += v.count_ones() as u64;
+            }
+
+            ranks.push((bv, rank.into_boxed_slice()))
+        }
+
+        ranks.into_boxed_slice()
+    }
+
+    #[inline]
+    fn get_rank(&self, hash: u64, i: usize) -> u64 {
+        let idx = hash as usize;
+        let (bv, ranks) = self.bitvecs.get(i).expect("that level doesn't exist");
+
+        // Last pre-computed rank
+        let mut rank = ranks[idx / 512];
+
+        // Add rank of intervening words
+        for j in (idx / 64) & !7..idx / 64 {
+            rank += bv.get_word(j).count_ones() as u64;
+        }
+
+        // Add rank of final word up to hash
+        let final_word = bv.get_word(idx / 64);
+        if idx % 64 > 0 {
+            rank += (final_word << (64 - (idx % 64))).count_ones() as u64;
+        }
+        rank
+    }
+}
+
+impl<'a, T: 'a + SeedableHash + Debug> Mphf<T> {
     /// Constructs an MPHF from a (possibly lazy) iterator over iterators.
     /// This allows construction of very large MPHFs without holding all the keys
     /// in memory simultaneously.
@@ -193,7 +361,7 @@ impl<'a, T: 'a + Hash + Debug> Mphf<T> {
 
                         object_pos = object_index + 1;
 
-                        let idx = hashmod(seed, &key, size);
+                        let idx = hashmod(seed, &&key, size);
 
                         if collide.contains(idx) {
                             a.remove(idx);
@@ -220,7 +388,7 @@ impl<'a, T: 'a + Hash + Debug> Mphf<T> {
     }
 }
 
-impl<T: Hash + Debug> Mphf<T> {
+impl<T: SeedableHash + Debug> Mphf<T> {
     /// Generate a minimal perfect hash function for the set of `objects`.
     /// `objects` must not contain any duplicate items.
     /// `gamma` controls the tradeoff between the construction-time and run-time speed,
@@ -268,49 +436,6 @@ impl<T: Hash + Debug> Mphf<T> {
         }
     }
 
-    fn compute_ranks(bvs: Vec<BitVector>) -> Box<[(BitVector, Box<[u64]>)]> {
-        let mut ranks = Vec::new();
-        let mut pop = 0_u64;
-
-        for bv in bvs {
-            let mut rank: Vec<u64> = Vec::new();
-            for i in 0..bv.num_words() {
-                let v = bv.get_word(i);
-
-                if i % 8 == 0 {
-                    rank.push(pop)
-                }
-
-                pop += v.count_ones() as u64;
-            }
-
-            ranks.push((bv, rank.into_boxed_slice()))
-        }
-
-        ranks.into_boxed_slice()
-    }
-
-    #[inline]
-    fn get_rank(&self, hash: u64, i: usize) -> u64 {
-        let idx = hash as usize;
-        let (bv, ranks) = self.bitvecs.get(i).expect("that level doesn't exist");
-
-        // Last pre-computed rank
-        let mut rank = ranks[idx / 512];
-
-        // Add rank of intervening words
-        for j in (idx / 64) & !7..idx / 64 {
-            rank += bv.get_word(j).count_ones() as u64;
-        }
-
-        // Add rank of final word up to hash
-        let final_word = bv.get_word(idx / 64);
-        if idx % 64 > 0 {
-            rank += (final_word << (64 - (idx % 64))).count_ones() as u64;
-        }
-        rank
-    }
-
     /// Compute the hash value of `item`. This method should only be used
     /// with items known to be in construction set. Use `try_hash` if you cannot
     /// guarantee that `item` was in the construction set. If `item` was not present
@@ -334,7 +459,7 @@ impl<T: Hash + Debug> Mphf<T> {
     pub fn try_hash<Q>(&self, item: &Q) -> Option<u64>
     where
         T: Borrow<Q>,
-        Q: ?Sized + Hash,
+        Q: ?Sized + SeedableHash,
     {
         for i in 0..self.bitvecs.len() {
             let (bv, _) = &(self.bitvecs)[i];
@@ -350,7 +475,7 @@ impl<T: Hash + Debug> Mphf<T> {
 }
 
 #[cfg(feature = "parallel")]
-impl<T: Hash + Debug + Sync + Send> Mphf<T> {
+impl<T: SeedableHash + Debug + Sync + Send> Mphf<T> {
     /// Same as `new`, but parallelizes work on the rayon default Rayon threadpool.
     /// Configure the number of threads on that threadpool to control CPU usage.
     #[cfg(feature = "parallel")]
@@ -420,14 +545,14 @@ impl Context {
     }
 
     #[cfg(feature = "parallel")]
-    fn find_collisions<T: Hash>(&self, v: &T) {
+    fn find_collisions<T: SeedableHash>(&self, v: &T) {
         let idx = hashmod(self.seed, v, self.size);
         if !self.collide.contains(idx) && !self.a.insert(idx) {
             self.collide.insert(idx);
         }
     }
 
-    fn find_collisions_sync<T: Hash>(&mut self, v: &T) {
+    fn find_collisions_sync<T: SeedableHash>(&mut self, v: &T) {
         let idx = hashmod(self.seed, v, self.size);
         if !self.collide.contains(idx) && !self.a.insert_sync(idx) {
             self.collide.insert_sync(idx);
@@ -435,7 +560,7 @@ impl Context {
     }
 
     #[cfg(feature = "parallel")]
-    fn filter<'t, T: Hash>(&self, v: &'t T) -> Option<&'t T> {
+    fn filter<'t, T: SeedableHash>(&self, v: &'t T) -> Option<&'t T> {
         let idx = hashmod(self.seed, v, self.size);
         if self.collide.contains(idx) {
             self.a.remove(idx);
@@ -446,7 +571,7 @@ impl Context {
     }
 
     #[cfg(not(feature = "parallel"))]
-    fn filter<'t, T: Hash>(&mut self, v: &'t T) -> Option<&'t T> {
+    fn filter<'t, T: SeedableHash>(&mut self, v: &'t T) -> Option<&'t T> {
         let idx = hashmod(self.seed, v, self.size);
         if self.collide.contains(idx) {
             self.a.remove(idx);
@@ -527,7 +652,10 @@ where
 }
 
 #[cfg(feature = "parallel")]
-impl<'a, T: 'a + Hash + Debug + Send + Sync> Mphf<T> {
+impl<'a, T: 'a + SeedableHash + Debug + Send + Sync> Mphf<T>
+where
+    &'a T: SeedableHash,
+{
     /// Same as to `from_chunked_iterator` but parallelizes work over `num_threads` threads.
     #[cfg(feature = "parallel")]
     pub fn from_chunked_iterator_parallel<I, N>(
@@ -695,7 +823,7 @@ mod tests {
     /// Check that a Minimal perfect hash function (MPHF) is generated for the set xs
     fn check_mphf<T>(xs: HashSet<T>) -> bool
     where
-        T: Sync + Hash + PartialEq + Eq + Debug + Send,
+        T: Sync + SeedableHash + PartialEq + Eq + Debug + Send,
     {
         let xsv: Vec<T> = xs.into_iter().collect();
 
@@ -706,7 +834,7 @@ mod tests {
     /// Check that a Minimal perfect hash function (MPHF) is generated for the set xs
     fn check_mphf_serial<T>(xsv: &[T]) -> bool
     where
-        T: Hash + PartialEq + Eq + Debug,
+        T: SeedableHash + PartialEq + Eq + Debug,
     {
         // Generate the MPHF
         let phf = Mphf::new(1.7, xsv);
@@ -725,7 +853,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     fn check_mphf_parallel<T>(xsv: &[T]) -> bool
     where
-        T: Sync + Hash + PartialEq + Eq + Debug + Send,
+        T: Sync + SeedableHash + PartialEq + Eq + Debug + Send,
     {
         // Generate the MPHF
         let phf = Mphf::new_parallel(1.7, xsv, None);
@@ -743,14 +871,14 @@ mod tests {
     #[cfg(not(feature = "parallel"))]
     fn check_mphf_parallel<T>(_xsv: &[T]) -> bool
     where
-        T: Hash + PartialEq + Eq + Debug,
+        T: SeedableHash + PartialEq + Eq + Debug,
     {
         true
     }
 
     fn check_chunked_mphf<T>(values: Vec<Vec<T>>, total: u64) -> bool
     where
-        T: Sync + Hash + PartialEq + Eq + Debug + Send,
+        T: Sync + SeedableHash + PartialEq + Eq + Debug + Send,
     {
         let phf = Mphf::from_chunked_iterator(1.7, &values, total);
 
@@ -770,7 +898,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     fn check_chunked_mphf_parallel<T>(values: Vec<Vec<T>>, total: u64) -> bool
     where
-        T: Sync + Hash + PartialEq + Eq + Debug + Send,
+        T: Sync + SeedableHash + PartialEq + Eq + Debug + Send,
     {
         let phf = Mphf::from_chunked_iterator_parallel(1.7, &values, None, total, 2);
 
